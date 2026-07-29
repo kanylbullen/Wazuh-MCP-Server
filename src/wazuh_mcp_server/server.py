@@ -274,14 +274,8 @@ app = FastAPI(
 # Get configuration
 config = get_config()
 
-# Create Wazuh configuration from server config
-wazuh_config = WazuhConfig(
-    wazuh_host=config.WAZUH_HOST,
-    wazuh_user=config.WAZUH_USER,
-    wazuh_pass=config.WAZUH_PASS,
-    wazuh_port=config.WAZUH_PORT,
-    verify_ssl=config.WAZUH_VERIFY_SSL
-)
+# Create Wazuh configuration from environment (includes indexer settings)
+wazuh_config = WazuhConfig.from_env()
 
 # Initialize Wazuh client
 wazuh_client = WazuhClient(wazuh_config)
