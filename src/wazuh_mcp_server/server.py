@@ -101,6 +101,15 @@ class MCPResponse(BaseModel):
     result: Optional[Any] = Field(default=None, description="Result data")
     error: Optional[Dict[str, Any]] = Field(default=None, description="Error object")
 
+    def dict(self, **kwargs):
+        """Override to exclude null error/result per JSON-RPC 2.0 spec."""
+        d = super().dict(**kwargs)
+        if d.get("error") is None:
+            d.pop("error", None)
+        if d.get("result") is None and d.get("error") is not None:
+            d.pop("result", None)
+        return d
+
 class MCPError(BaseModel):
     """MCP JSON-RPC 2.0 Error object."""
     code: int = Field(description="Error code")
