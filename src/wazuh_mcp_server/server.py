@@ -75,10 +75,21 @@ async def verify_authentication(authorization: Optional[str], config) -> bool:
         )
 
     # Bearer token mode (default)
+    # Accepts both wst_ session tokens and wazuh_ API keys directly
     try:
-        from wazuh_mcp_server.auth import verify_bearer_token
-        await verify_bearer_token(authorization)
-        return True
+        from wazuh_mcp_server.auth import verify_bearer_token, auth_manager
+        token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+
+        # Try session token first (wst_)
+        if token.startswith("wst_"):
+            await verify_bearer_token(authorization)
+            return True
+
+        # Try API key directly (wazuh_) — allows long-lived auth without token exchange
+        if token.startswith("wazuh_") and auth_manager.validate_api_key(token):
+            return True
+
+        raise ValueError("Invalid or expired token")
     except ValueError as e:
         raise HTTPException(
             status_code=401,
@@ -100,6 +111,15 @@ class MCPResponse(BaseModel):
     id: Optional[Union[str, int]] = Field(default=None, description="Request ID")
     result: Optional[Any] = Field(default=None, description="Result data")
     error: Optional[Dict[str, Any]] = Field(default=None, description="Error object")
+
+    def dict(self, **kwargs):
+        """Override to exclude null error/result per JSON-RPC 2.0 spec."""
+        d = super().dict(**kwargs)
+        if d.get("error") is None:
+            d.pop("error", None)
+        if d.get("result") is None and d.get("error") is not None:
+            d.pop("result", None)
+        return d
 
 class MCPError(BaseModel):
     """MCP JSON-RPC 2.0 Error object."""
@@ -274,14 +294,8 @@ app = FastAPI(
 # Get configuration
 config = get_config()
 
-# Create Wazuh configuration from server config
-wazuh_config = WazuhConfig(
-    wazuh_host=config.WAZUH_HOST,
-    wazuh_user=config.WAZUH_USER,
-    wazuh_pass=config.WAZUH_PASS,
-    wazuh_port=config.WAZUH_PORT,
-    verify_ssl=config.WAZUH_VERIFY_SSL
-)
+# Create Wazuh configuration from environment (includes indexer settings)
+wazuh_config = WazuhConfig.from_env()
 
 # Initialize Wazuh client
 wazuh_client = WazuhClient(wazuh_config)
@@ -387,16 +401,93 @@ def validate_protocol_version(version: Optional[str]) -> str:
     return "2025-03-26"
 
 # MCP Protocol Handlers
+
+def _compact_alert(alert: dict) -> dict:
+    """Strip a raw Wazuh alert to essential fields for MCP output."""
+    compact = {}
+    if "timestamp" in alert:
+        compact["timestamp"] = alert["timestamp"]
+    agent = alert.get("agent", {})
+    if agent:
+        compact["agent"] = {"id": agent.get("id", ""), "name": agent.get("name", "")}
+    rule = alert.get("rule", {})
+    if rule:
+        compact["rule"] = {
+            "id": rule.get("id", ""),
+            "level": rule.get("level", 0),
+            "description": rule.get("description", ""),
+            "groups": rule.get("groups", []),
+        }
+        if rule.get("mitre"):
+            compact["rule"]["mitre"] = rule["mitre"]
+    src = alert.get("data", {})
+    if src.get("srcip"):
+        compact["srcip"] = src["srcip"]
+    if src.get("dstip"):
+        compact["dstip"] = src["dstip"]
+    if alert.get("syscheck"):
+        sc = alert["syscheck"]
+        compact["syscheck"] = {"path": sc.get("path", ""), "event": sc.get("event", "")}
+    if alert.get("full_log"):
+        log = alert["full_log"]
+        compact["full_log"] = (log[:300] + "...") if len(log) > 300 else log
+    return compact
+
+
+def _compact_alerts_result(result: dict) -> dict:
+    """Apply compaction to a standard alerts result dict."""
+    data = result.get("data", {})
+    items = data.get("affected_items", [])
+    data["affected_items"] = [_compact_alert(a) for a in items]
+    return result
+
+
+
+def _compact_vulnerability(vuln: dict) -> dict:
+    """Strip a raw Wazuh vulnerability to essential fields for MCP output."""
+    compact = {}
+    for key in ("id", "severity"):
+        if key in vuln:
+            compact[key] = vuln[key]
+    if "description" in vuln:
+        desc = vuln["description"]
+        compact["description"] = (desc[:120] + "...") if len(desc) > 120 else desc
+    if "published_at" in vuln:
+        compact["published_at"] = vuln["published_at"]
+    pkg = vuln.get("package", {})
+    if pkg:
+        compact["package"] = {"name": pkg.get("name", ""), "version": pkg.get("version", "")}
+    agent = vuln.get("agent", {})
+    if agent:
+        compact["agent"] = {"id": agent.get("id", ""), "name": agent.get("name", "")}
+    return compact
+
+
+def _compact_vulns_result(result: dict) -> dict:
+    """Apply compaction to a standard vulnerabilities result dict."""
+    data = result.get("data", {})
+    items = data.get("affected_items", [])
+    if items:
+        data["affected_items"] = [_compact_vulnerability(v) for v in items]
+    return result
+
+
 async def handle_initialize(params: Dict[str, Any], session: MCPSession) -> Dict[str, Any]:
     """Handle MCP initialize method."""
-    protocol_version = params.get("protocolVersion", "")
+    protocol_version = params.get("protocolVersion", "2025-06-18")
     capabilities = params.get("capabilities", {})
     client_info = params.get("clientInfo", {})
-    
+
     # Store client information
     session.capabilities = capabilities
     session.client_info = client_info
-    
+
+    # Negotiate protocol version — respond with client's version if supported
+    if protocol_version in SUPPORTED_PROTOCOL_VERSIONS:
+        negotiated_version = protocol_version
+    else:
+        negotiated_version = MCP_PROTOCOL_VERSION
+
     # Server capabilities
     server_capabilities = {
         "logging": {},
@@ -411,7 +502,7 @@ async def handle_initialize(params: Dict[str, Any], session: MCPSession) -> Dict
             "listChanged": True
         }
     }
-    
+
     # Server information
     server_info = {
         "name": "Wazuh MCP Server",
@@ -419,9 +510,9 @@ async def handle_initialize(params: Dict[str, Any], session: MCPSession) -> Dict
         "vendor": "GenSec AI",
         "description": "MCP-compliant remote server for Wazuh SIEM integration"
     }
-    
+
     return {
-        "protocolVersion": "2025-03-26",
+        "protocolVersion": negotiated_version,
         "capabilities": server_capabilities,
         "serverInfo": server_info,
         "instructions": "Connected to Wazuh MCP Server. Use available tools for security operations."
@@ -442,7 +533,8 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
                     "level": {"type": "string", "description": "Filter by alert level (e.g., '12', '10+')"},
                     "agent_id": {"type": "string", "description": "Filter by agent ID"},
                     "timestamp_start": {"type": "string", "description": "Start timestamp (ISO format)"},
-                    "timestamp_end": {"type": "string", "description": "End timestamp (ISO format)"}
+                    "timestamp_end": {"type": "string", "description": "End timestamp (ISO format)"},
+                    "compact": {"type": "boolean", "default": True, "description": "Return compact alerts with essential fields only (recommended to avoid token limits)"}
                 },
                 "required": []
             }
@@ -479,7 +571,8 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
                 "properties": {
                     "query": {"type": "string", "description": "Search query or pattern"},
                     "time_range": {"type": "string", "enum": ["1h", "6h", "24h", "7d"], "default": "24h"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 100},
+                    "compact": {"type": "boolean", "default": True, "description": "Return compact events with essential fields only (recommended to avoid token limits)"}
                 },
                 "required": ["query"]
             }
@@ -564,7 +657,8 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
                 "properties": {
                     "agent_id": {"type": "string", "description": "Filter by specific agent ID"},
                     "severity": {"type": "string", "enum": ["low", "medium", "high", "critical"], "description": "Filter by severity level"},
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100},
+                    "compact": {"type": "boolean", "default": True, "description": "Return compact vulnerabilities with essential fields only (recommended to avoid token limits)"}
                 },
                 "required": []
             }
@@ -575,7 +669,8 @@ async def handle_tools_list(params: Dict[str, Any], session: MCPSession) -> Dict
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 50},
+                    "compact": {"type": "boolean", "default": True, "description": "Return compact vulnerabilities with essential fields only (recommended to avoid token limits)"}
                 },
                 "required": []
             }
@@ -785,12 +880,15 @@ async def handle_tools_call(params: Dict[str, Any], session: MCPSession) -> Dict
             agent_id = arguments.get("agent_id")
             timestamp_start = arguments.get("timestamp_start")
             timestamp_end = arguments.get("timestamp_end")
+            compact = arguments.get("compact", True)
             result = await wazuh_client.get_alerts(
                 limit=limit, rule_id=rule_id, level=level, 
                 agent_id=agent_id, timestamp_start=timestamp_start, 
                 timestamp_end=timestamp_end
             )
-            return {"content": [{"type": "text", "text": f"Wazuh Alerts:\n{json.dumps(result, indent=2)}"}]}
+            if compact:
+                result = _compact_alerts_result(result)
+            return {"content": [{"type": "text", "text": f"Wazuh Alerts:\n{json.dumps(result)}"}]}
             
         elif tool_name == "get_wazuh_alert_summary":
             time_range = arguments.get("time_range", "24h")
@@ -802,14 +900,17 @@ async def handle_tools_call(params: Dict[str, Any], session: MCPSession) -> Dict
             time_range = arguments.get("time_range", "24h")
             min_frequency = arguments.get("min_frequency", 5)
             result = await wazuh_client.analyze_alert_patterns(time_range, min_frequency)
-            return {"content": [{"type": "text", "text": f"Alert Patterns:\n{json.dumps(result, indent=2)}"}]}
+            return {"content": [{"type": "text", "text": f"Alert Patterns:\n{json.dumps(result)}"}]}
             
         elif tool_name == "search_security_events":
             query = arguments.get("query")
             time_range = arguments.get("time_range", "24h")
             limit = arguments.get("limit", 100)
+            compact = arguments.get("compact", True)
             result = await wazuh_client.search_security_events(query, time_range, limit)
-            return {"content": [{"type": "text", "text": f"Security Events:\n{json.dumps(result, indent=2)}"}]}
+            if compact:
+                result = _compact_alerts_result(result)
+            return {"content": [{"type": "text", "text": f"Security Events:\n{json.dumps(result)}"}]}
 
         # Agent Management Tools
         elif tool_name == "get_wazuh_agents":
@@ -850,18 +951,27 @@ async def handle_tools_call(params: Dict[str, Any], session: MCPSession) -> Dict
             agent_id = arguments.get("agent_id")
             severity = arguments.get("severity")
             limit = arguments.get("limit", 100)
+            compact = arguments.get("compact", True)
             result = await wazuh_client.get_vulnerabilities(agent_id=agent_id, severity=severity, limit=limit)
-            return {"content": [{"type": "text", "text": f"Vulnerabilities:\n{json.dumps(result, indent=2)}"}]}
+            if compact:
+                result = _compact_vulns_result(result)
+            return {"content": [{"type": "text", "text": f"Vulnerabilities:\n{json.dumps(result)}"}]}
             
         elif tool_name == "get_wazuh_critical_vulnerabilities":
             limit = arguments.get("limit", 50)
+            compact = arguments.get("compact", True)
             result = await wazuh_client.get_critical_vulnerabilities(limit)
-            return {"content": [{"type": "text", "text": f"Critical Vulnerabilities:\n{json.dumps(result, indent=2)}"}]}
+            if compact:
+                result = _compact_vulns_result(result)
+            return {"content": [{"type": "text", "text": f"Critical Vulnerabilities:\n{json.dumps(result)}"}]}
             
         elif tool_name == "get_wazuh_vulnerability_summary":
             time_range = arguments.get("time_range", "7d")
+            compact = arguments.get("compact", True)
             result = await wazuh_client.get_vulnerability_summary(time_range)
-            return {"content": [{"type": "text", "text": f"Vulnerability Summary:\n{json.dumps(result, indent=2)}"}]}
+            if compact:
+                result = _compact_vulns_result(result)
+            return {"content": [{"type": "text", "text": f"Vulnerability Summary:\n{json.dumps(result)}"}]}
 
         # Security Analysis Tools  
         elif tool_name == "analyze_security_threat":
@@ -1009,6 +1119,7 @@ async def generate_sse_events(session: MCPSession):
 @app.post("/")
 async def mcp_endpoint(
     request: Request,
+    authorization: str = Header(None),
     origin: Optional[str] = Header(None),
     accept: Optional[str] = Header(None),
     mcp_session_id: Optional[str] = Header(None, alias="Mcp-Session-Id"),
@@ -1019,39 +1130,39 @@ async def mcp_endpoint(
     GET: Returns SSE stream for real-time communication
     POST: Handles JSON-RPC requests
     """
+    # Verify authentication
+    await verify_authentication(authorization, config)
+
     # Track metrics
     REQUEST_COUNT.labels(
         method=request.method,
         endpoint="/",
         status_code=200
     ).inc()
-    
+
     ACTIVE_CONNECTIONS.inc()
-    
+
     try:
-        # Origin validation for security
-        if not origin:
-            raise HTTPException(status_code=403, detail="Origin header required")
-        
-        # Validate origin against allowed list
-        allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
-        if allowed_origins_list and origin not in allowed_origins_list:
-            # Check for wildcard patterns
-            origin_allowed = False
-            for allowed in allowed_origins_list:
-                if allowed == "*" or allowed == origin:
-                    origin_allowed = True
-                    break
-                elif allowed.startswith("*") and origin.endswith(allowed[1:]):
-                    origin_allowed = True
-                    break
-                elif "localhost" in allowed and "localhost" in origin:
-                    origin_allowed = True
-                    break
-            
-            if not origin_allowed:
-                raise HTTPException(status_code=403, detail="Origin not allowed")
-        
+        # Origin validation for security (only if provided; CLI clients may not send Origin)
+        if origin:
+            # Validate origin against allowed list
+            allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
+            if allowed_origins_list and origin not in allowed_origins_list:
+                origin_allowed = False
+                for allowed in allowed_origins_list:
+                    if allowed == "*" or allowed == origin:
+                        origin_allowed = True
+                        break
+                    elif allowed.startswith("*") and origin.endswith(allowed[1:]):
+                        origin_allowed = True
+                        break
+                    elif "localhost" in allowed and "localhost" in origin:
+                        origin_allowed = True
+                        break
+
+                if not origin_allowed:
+                    raise HTTPException(status_code=403, detail="Origin not allowed")
+
         # Rate limiting
         client_ip = request.client.host if request.client else "unknown"
         allowed, retry_after = rate_limiter.is_allowed(client_ip)
@@ -1191,29 +1302,25 @@ async def mcp_sse_endpoint(
     # Verify authentication based on configured mode
     await verify_authentication(authorization, config)
 
-    # Origin validation for security
-    if not origin:
-        raise HTTPException(status_code=403, detail="Origin header required")
-    
-    # Validate origin against allowed list
-    allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
-    if allowed_origins_list and origin not in allowed_origins_list:
-        # Check for wildcard patterns
-        origin_allowed = False
-        for allowed in allowed_origins_list:
-            if allowed == "*" or allowed == origin:
-                origin_allowed = True
-                break
-            elif allowed.startswith("*") and origin.endswith(allowed[1:]):
-                origin_allowed = True
-                break
-            elif "localhost" in allowed and "localhost" in origin:
-                origin_allowed = True
-                break
-        
-        if not origin_allowed:
-            raise HTTPException(status_code=403, detail="Origin not allowed")
-    
+    # Origin validation (only if provided; CLI clients may not send Origin)
+    if origin:
+        allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
+        if allowed_origins_list and origin not in allowed_origins_list:
+            origin_allowed = False
+            for allowed in allowed_origins_list:
+                if allowed == "*" or allowed == origin:
+                    origin_allowed = True
+                    break
+                elif allowed.startswith("*") and origin.endswith(allowed[1:]):
+                    origin_allowed = True
+                    break
+                elif "localhost" in allowed and "localhost" in origin:
+                    origin_allowed = True
+                    break
+
+            if not origin_allowed:
+                raise HTTPException(status_code=403, detail="Origin not allowed")
+
     # Rate limiting
     client_ip = request.client.host if request.client else "unknown"
     allowed, retry_after = rate_limiter.is_allowed(client_ip)
@@ -1279,27 +1386,24 @@ async def mcp_streamable_http_endpoint(
     # Verify authentication based on configured mode
     await verify_authentication(authorization, config)
 
-    # Origin validation for security (DNS rebinding protection)
-    if not origin:
-        raise HTTPException(status_code=403, detail="Origin header required")
+    # Origin validation (only if provided; CLI clients may not send Origin)
+    if origin:
+        allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
+        if allowed_origins_list and origin not in allowed_origins_list:
+            origin_allowed = False
+            for allowed in allowed_origins_list:
+                if allowed == "*" or allowed == origin:
+                    origin_allowed = True
+                    break
+                elif allowed.startswith("*") and origin.endswith(allowed[1:]):
+                    origin_allowed = True
+                    break
+                elif "localhost" in allowed and "localhost" in origin:
+                    origin_allowed = True
+                    break
 
-    # Validate origin against allowed list
-    allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
-    if allowed_origins_list and origin not in allowed_origins_list:
-        origin_allowed = False
-        for allowed in allowed_origins_list:
-            if allowed == "*" or allowed == origin:
-                origin_allowed = True
-                break
-            elif allowed.startswith("*") and origin.endswith(allowed[1:]):
-                origin_allowed = True
-                break
-            elif "localhost" in allowed and "localhost" in origin:
-                origin_allowed = True
-                break
-
-        if not origin_allowed:
-            raise HTTPException(status_code=403, detail="Origin not allowed")
+            if not origin_allowed:
+                raise HTTPException(status_code=403, detail="Origin not allowed")
 
     # Rate limiting
     client_ip = request.client.host if request.client else "unknown"
@@ -1581,37 +1685,33 @@ async def oauth_metadata(request: Request):
 # Authentication endpoint for API key validation
 @app.post("/auth/token")
 async def get_auth_token(request: Request):
-    """Get JWT token using API key."""
+    """Exchange API key for a session token (wst_) validated by AuthManager."""
     try:
         body = await request.json()
         api_key = body.get("api_key")
-        
+
         if not api_key:
             raise HTTPException(status_code=400, detail="API key required")
-        
-        # In a real implementation, validate API key against database
-        # For now, accept any key that starts with "wazuh_" 
-        if not api_key.startswith("wazuh_"):
+
+        # Validate API key using AuthManager (HMAC-SHA256 verified against API_KEYS config)
+        from wazuh_mcp_server.auth import auth_manager
+        token = auth_manager.create_token(api_key)
+        if not token:
             raise HTTPException(status_code=401, detail="Invalid API key")
-        
-        # Create JWT token with safe payload (no API key exposure)
-        token = create_access_token(
-            data={
-                "sub": "wazuh_mcp_user",
-                "iat": datetime.now(timezone.utc).timestamp(),
-                "scope": "wazuh:read wazuh:write"
-            },
-            secret_key=config.AUTH_SECRET_KEY
-        )
-        
+
+        token_obj = auth_manager.tokens[token]
+        expires_in = int((token_obj.expires_at - datetime.now(timezone.utc)).total_seconds())
+
         return {
             "access_token": token,
             "token_type": "bearer",
-            "expires_in": 86400  # 24 hours
+            "expires_in": expires_in
         }
-    
+
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Token generation error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
