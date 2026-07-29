@@ -1302,29 +1302,25 @@ async def mcp_sse_endpoint(
     # Verify authentication based on configured mode
     await verify_authentication(authorization, config)
 
-    # Origin validation for security
-    if not origin:
-        raise HTTPException(status_code=403, detail="Origin header required")
-    
-    # Validate origin against allowed list
-    allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
-    if allowed_origins_list and origin not in allowed_origins_list:
-        # Check for wildcard patterns
-        origin_allowed = False
-        for allowed in allowed_origins_list:
-            if allowed == "*" or allowed == origin:
-                origin_allowed = True
-                break
-            elif allowed.startswith("*") and origin.endswith(allowed[1:]):
-                origin_allowed = True
-                break
-            elif "localhost" in allowed and "localhost" in origin:
-                origin_allowed = True
-                break
-        
-        if not origin_allowed:
-            raise HTTPException(status_code=403, detail="Origin not allowed")
-    
+    # Origin validation (only if provided; CLI clients may not send Origin)
+    if origin:
+        allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
+        if allowed_origins_list and origin not in allowed_origins_list:
+            origin_allowed = False
+            for allowed in allowed_origins_list:
+                if allowed == "*" or allowed == origin:
+                    origin_allowed = True
+                    break
+                elif allowed.startswith("*") and origin.endswith(allowed[1:]):
+                    origin_allowed = True
+                    break
+                elif "localhost" in allowed and "localhost" in origin:
+                    origin_allowed = True
+                    break
+
+            if not origin_allowed:
+                raise HTTPException(status_code=403, detail="Origin not allowed")
+
     # Rate limiting
     client_ip = request.client.host if request.client else "unknown"
     allowed, retry_after = rate_limiter.is_allowed(client_ip)
@@ -1390,27 +1386,24 @@ async def mcp_streamable_http_endpoint(
     # Verify authentication based on configured mode
     await verify_authentication(authorization, config)
 
-    # Origin validation for security (DNS rebinding protection)
-    if not origin:
-        raise HTTPException(status_code=403, detail="Origin header required")
+    # Origin validation (only if provided; CLI clients may not send Origin)
+    if origin:
+        allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
+        if allowed_origins_list and origin not in allowed_origins_list:
+            origin_allowed = False
+            for allowed in allowed_origins_list:
+                if allowed == "*" or allowed == origin:
+                    origin_allowed = True
+                    break
+                elif allowed.startswith("*") and origin.endswith(allowed[1:]):
+                    origin_allowed = True
+                    break
+                elif "localhost" in allowed and "localhost" in origin:
+                    origin_allowed = True
+                    break
 
-    # Validate origin against allowed list
-    allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
-    if allowed_origins_list and origin not in allowed_origins_list:
-        origin_allowed = False
-        for allowed in allowed_origins_list:
-            if allowed == "*" or allowed == origin:
-                origin_allowed = True
-                break
-            elif allowed.startswith("*") and origin.endswith(allowed[1:]):
-                origin_allowed = True
-                break
-            elif "localhost" in allowed and "localhost" in origin:
-                origin_allowed = True
-                break
-
-        if not origin_allowed:
-            raise HTTPException(status_code=403, detail="Origin not allowed")
+            if not origin_allowed:
+                raise HTTPException(status_code=403, detail="Origin not allowed")
 
     # Rate limiting
     client_ip = request.client.host if request.client else "unknown"
