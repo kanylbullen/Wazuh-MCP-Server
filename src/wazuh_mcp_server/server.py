@@ -413,9 +413,9 @@ async def handle_initialize(params: Dict[str, Any], session: MCPSession) -> Dict
         "vendor": "GenSec AI",
         "description": "MCP-compliant remote server for Wazuh SIEM integration"
     }
-    
+
     return {
-        "protocolVersion": "2025-03-26",
+        "protocolVersion": negotiated_version,
         "capabilities": server_capabilities,
         "serverInfo": server_info,
         "instructions": "Connected to Wazuh MCP Server. Use available tools for security operations."
