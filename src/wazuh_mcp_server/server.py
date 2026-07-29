@@ -75,10 +75,21 @@ async def verify_authentication(authorization: Optional[str], config) -> bool:
         )
 
     # Bearer token mode (default)
+    # Accepts both wst_ session tokens and wazuh_ API keys directly
     try:
-        from wazuh_mcp_server.auth import verify_bearer_token
-        await verify_bearer_token(authorization)
-        return True
+        from wazuh_mcp_server.auth import verify_bearer_token, auth_manager
+        token = authorization.replace("Bearer ", "") if authorization.startswith("Bearer ") else authorization
+
+        # Try session token first (wst_)
+        if token.startswith("wst_"):
+            await verify_bearer_token(authorization)
+            return True
+
+        # Try API key directly (wazuh_) — allows long-lived auth without token exchange
+        if token.startswith("wazuh_") and auth_manager.validate_api_key(token):
+            return True
+
+        raise ValueError("Invalid or expired token")
     except ValueError as e:
         raise HTTPException(
             status_code=401,
