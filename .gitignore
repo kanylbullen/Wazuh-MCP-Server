@@ -62,3 +62,11 @@ Thumbs.db
 
 # Sensitive documentation (maintainer-only content)
 MAINTAINER_MANUAL.md
+# Secrets and local backups (hardened 2026-07-29)
+.env*
+!.env.example
+*.bak*
+*.orig
+*~
+config/*.env
+!config/*.env.example
