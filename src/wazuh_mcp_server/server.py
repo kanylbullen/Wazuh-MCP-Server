@@ -1003,6 +1003,7 @@ async def generate_sse_events(session: MCPSession):
 @app.post("/")
 async def mcp_endpoint(
     request: Request,
+    authorization: str = Header(None),
     origin: Optional[str] = Header(None),
     accept: Optional[str] = Header(None),
     mcp_session_id: Optional[str] = Header(None, alias="Mcp-Session-Id"),
@@ -1013,39 +1014,39 @@ async def mcp_endpoint(
     GET: Returns SSE stream for real-time communication
     POST: Handles JSON-RPC requests
     """
+    # Verify authentication
+    await verify_authentication(authorization, config)
+
     # Track metrics
     REQUEST_COUNT.labels(
         method=request.method,
         endpoint="/",
         status_code=200
     ).inc()
-    
+
     ACTIVE_CONNECTIONS.inc()
-    
+
     try:
-        # Origin validation for security
-        if not origin:
-            raise HTTPException(status_code=403, detail="Origin header required")
-        
-        # Validate origin against allowed list
-        allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
-        if allowed_origins_list and origin not in allowed_origins_list:
-            # Check for wildcard patterns
-            origin_allowed = False
-            for allowed in allowed_origins_list:
-                if allowed == "*" or allowed == origin:
-                    origin_allowed = True
-                    break
-                elif allowed.startswith("*") and origin.endswith(allowed[1:]):
-                    origin_allowed = True
-                    break
-                elif "localhost" in allowed and "localhost" in origin:
-                    origin_allowed = True
-                    break
-            
-            if not origin_allowed:
-                raise HTTPException(status_code=403, detail="Origin not allowed")
-        
+        # Origin validation for security (only if provided; CLI clients may not send Origin)
+        if origin:
+            # Validate origin against allowed list
+            allowed_origins_list = config.ALLOWED_ORIGINS.split(",") if config.ALLOWED_ORIGINS else []
+            if allowed_origins_list and origin not in allowed_origins_list:
+                origin_allowed = False
+                for allowed in allowed_origins_list:
+                    if allowed == "*" or allowed == origin:
+                        origin_allowed = True
+                        break
+                    elif allowed.startswith("*") and origin.endswith(allowed[1:]):
+                        origin_allowed = True
+                        break
+                    elif "localhost" in allowed and "localhost" in origin:
+                        origin_allowed = True
+                        break
+
+                if not origin_allowed:
+                    raise HTTPException(status_code=403, detail="Origin not allowed")
+
         # Rate limiting
         client_ip = request.client.host if request.client else "unknown"
         allowed, retry_after = rate_limiter.is_allowed(client_ip)
