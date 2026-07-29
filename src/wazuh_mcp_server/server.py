@@ -1575,37 +1575,33 @@ async def oauth_metadata(request: Request):
 # Authentication endpoint for API key validation
 @app.post("/auth/token")
 async def get_auth_token(request: Request):
-    """Get JWT token using API key."""
+    """Exchange API key for a session token (wst_) validated by AuthManager."""
     try:
         body = await request.json()
         api_key = body.get("api_key")
-        
+
         if not api_key:
             raise HTTPException(status_code=400, detail="API key required")
-        
-        # In a real implementation, validate API key against database
-        # For now, accept any key that starts with "wazuh_" 
-        if not api_key.startswith("wazuh_"):
+
+        # Validate API key using AuthManager (HMAC-SHA256 verified against API_KEYS config)
+        from wazuh_mcp_server.auth import auth_manager
+        token = auth_manager.create_token(api_key)
+        if not token:
             raise HTTPException(status_code=401, detail="Invalid API key")
-        
-        # Create JWT token with safe payload (no API key exposure)
-        token = create_access_token(
-            data={
-                "sub": "wazuh_mcp_user",
-                "iat": datetime.now(timezone.utc).timestamp(),
-                "scope": "wazuh:read wazuh:write"
-            },
-            secret_key=config.AUTH_SECRET_KEY
-        )
-        
+
+        token_obj = auth_manager.tokens[token]
+        expires_in = int((token_obj.expires_at - datetime.now(timezone.utc)).total_seconds())
+
         return {
             "access_token": token,
             "token_type": "bearer",
-            "expires_in": 86400  # 24 hours
+            "expires_in": expires_in
         }
-    
+
     except json.JSONDecodeError:
         raise HTTPException(status_code=400, detail="Invalid JSON")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Token generation error: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
