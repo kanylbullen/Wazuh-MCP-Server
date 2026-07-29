@@ -502,7 +502,7 @@ async def handle_initialize(params: Dict[str, Any], session: MCPSession) -> Dict
             "listChanged": True
         }
     }
-    
+
     # Server information
     server_info = {
         "name": "Wazuh MCP Server",

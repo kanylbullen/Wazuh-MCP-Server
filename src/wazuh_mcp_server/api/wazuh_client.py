@@ -83,25 +83,25 @@ class WazuhClient:
                 logger.info("Wazuh Indexer client initialized successfully")
             except Exception as e:
                 logger.warning(f"Wazuh Indexer initialization failed: {e}")
-    
+
     async def _authenticate(self):
         """Authenticate with Wazuh API."""
         auth_url = f"{self.config.base_url}/security/user/authenticate"
-        
+
         try:
             response = await self.client.post(
                 auth_url,
                 auth=(self.config.wazuh_user, self.config.wazuh_pass)
             )
             response.raise_for_status()
-            
+
             data = response.json()
             if "data" not in data or "token" not in data["data"]:
                 raise ValueError("Invalid authentication response from Wazuh API")
-            
+
             self.token = data["data"]["token"]
             print(f"✅ Authenticated with Wazuh server at {self.config.wazuh_host}")
-            
+
         except httpx.ConnectError:
             raise ConnectionError(f"Cannot connect to Wazuh server at {self.config.wazuh_host}:{self.config.wazuh_port}")
         except httpx.TimeoutException:

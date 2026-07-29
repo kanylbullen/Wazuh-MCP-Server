@@ -56,7 +56,7 @@ class WazuhIndexerClient:
         username: Optional[str] = None,
         password: Optional[str] = None,
         verify_ssl: bool = True,
-        timeout: int = 30
+        timeout: int = 30,
     ):
         self.host = host
         self.port = port
